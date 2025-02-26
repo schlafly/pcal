@@ -23,6 +23,8 @@ import numba
 import healpy
 import tqdm
 from astropy import stats
+import multiprocessing
+import multiprocessing.shared_memory
 
 global_saved_data = dict()
 
@@ -31,11 +33,17 @@ badmask = dict(
     image_scatter = 2,
     image_noobs = 4,
     image_manual = 8,
-    star_resid = 16,
-    star_noobs = 32,
+    image_manybad = 16,
+    image_chip = 32,
+    star_resid = 64,
+    star_noobs = 128,
+    obs_manual = 256,
 )
 image_masks = (badmask['image_median'] | badmask['image_scatter'] |
-               badmask['image_noobs'] | badmask['image_manual'])
+               badmask['image_noobs'] | badmask['image_manual'] |
+               badmask['image_manybad'] | badmask['image_chip'])
+star_masks = badmask['star_resid'] | badmask['star_noobs']
+
 
 catdtype = [('objid', 'i8'),
             ('instmag', 'f4'),
@@ -162,7 +170,7 @@ def gather_data(files, nproc=1):
         executor = ProcessPoolExecutor(max_workers=nproc)
 
     for files in [files_all[i:i + chunk]
-                  for i in range(0, len(files_all), 1000)]:
+                  for i in range(0, len(files_all), chunk)]:
         if nproc <= 1:
             iterator = (read_file(f) for f in tqdm.tqdm(files))
         else:
@@ -608,6 +616,9 @@ def solve_dr11(obj, nproc=1, method='L-BFGS-B',
     if clear_bmask:
         for hp in obj.keys():
             obj[hp]['bmask'] = 0  # clear bad mask
+    for hp in obj.keys():
+        obj[hp]['bmask'] |= badmask['obs_manual'] * (obj[hp]['ccdnum'] == 31)
+        # mask all of S7 / ccd 31.
     compute_weights_and_averages(obj)  # recompute weights
     for hp in obj.keys():
         kwargs[hp] = dict()
@@ -668,17 +679,24 @@ def solve_dr11(obj, nproc=1, method='L-BFGS-B',
     fun = loss_generic_grouped
     kwargs['grad'] = grad_loss_generic_np_global2
     global_saved_data['kwargs'] = kwargs
+    pastinfo = []
 
     if options is None:
         options = dict(iprint=1)
+
+    print('a next step here is to walk in the clipping from large to small '
+          'to try to clip bad exposures before the good exposures they '
+          'overlap.  I think a good approach there is to give clip_stars '
+          'a scale argument that drops by a factor of two each iteration.')
     for i in range(clipiter):
 
         if nproc > 1:
             # from concurrent.futures import ProcessPoolExecutor
             # executor = ProcessPoolExecutor(max_workers=nproc)
-            from multiprocessing import pool
-            executor = pool.Pool(nproc)
+            executor = multiprocessing.Pool(nproc)
             kwargs['executor'] = executor
+        else:
+            executor = None
 
         options['maxiter'] = optiter
         res = minimize(fun, guess, args=(kwargs,),
@@ -686,7 +704,7 @@ def solve_dr11(obj, nproc=1, method='L-BFGS-B',
                        method=method,
                        options=options)
         guess = res.x
-        imstats = image_stats(obj, res.x, kwargs)
+        imstats = image_stats(obj, res.x, kwargs, nproc=nproc)
         clip_stars(obj, res.x, kwargs, imstats, badfun=badfun)
         # need to reach into kwargs again
         compute_weights_and_averages(obj)  # recompute weights
@@ -694,12 +712,13 @@ def solve_dr11(obj, nproc=1, method='L-BFGS-B',
             kwargs[hp]['weight'] = obj[hp]['weight']
             kwargs[hp]['instmag'] = obj[hp]['instmag']
             kwargs[hp]['avginstmag'] = obj[hp]['avginstmag']
+        pastinfo.append((res, imstats))
 
         if nproc > 1:
             # kwargs['executor'].shutdown()
             kwargs['executor'].terminate()
 
-    return res, imstats, paramdat
+    return res, imstats, paramdat, pastinfo
 
 
 
@@ -756,8 +775,7 @@ def solve_dr11_simple(obj, nproc=1, maxiter=100000, method='L-BFGS-B',
     if nproc > 1:
         # from concurrent.futures import ProcessPoolExecutor
         # executor = ProcessPoolExecutor(max_workers=nproc)
-        from multiprocessing import pool
-        executor = pool.Pool(nproc)
+        executor = multiprocessing.Pool(nproc)
         kwargs['executor'] = executor
 
     if options is None:
@@ -865,57 +883,143 @@ def fake_measurements_real_data(obj, scale_errors=1):
     return param
 
 
-def image_stats(obj, param, kwargs, index='expnum'):
+def fill_det(i, param, dtype):
+    obj = global_saved_data['obj'][i]
+    kwargs = global_saved_data['kwargs'][i]
+    n = len(obj['dmag'])
+    out = np.zeros(n, dtype=dtype)
+    magd = get_mags(obj, param, kwargs)
+    out['cal'] = magd['cal']
+    out['avg'] = magd['avg']
+    out['neff'] = magd['neff']
+    out['dmag'] = obj['dmag']
+    index = out.dtype.names[4]  # brittle!
+    out[index] = obj[index]
+    out['bmask'] = obj['bmask']
+    out['ccdnum'] = obj['ccdnum']
+    return out
+
+
+def exp_image_stats(shm, ndet, f, l, outdtype, detdtype):
+    shm = multiprocessing.shared_memory.SharedMemory(name=shm)
+    det = np.ndarray(ndet, dtype=detdtype, buffer=shm.buf)
+    ind = det['s'][f:l]
+    index = outdtype.names[0]
+    nexp = len(np.unique(det[index][ind]))
+    if nexp > 1:
+        ss = util_efs.subslices(det[index][ind])
+        return np.concatenate([
+            exp_image_stats(shm.name, ndet, f+f2, f+l2, outdtype,
+                            detdtype)
+            for (f2, l2) in ss])
+    out = np.zeros(1, dtype=outdtype)
+    keep = det['neff'][ind] > 0
+    # intentionally do not use the bmasks here
+    # trust instead median & mad_std to be robust.
+    # note that the mean magnitudes _do_ use the bmasks
+    # so we shouldn't be including bad data in the means
+    # but we may intentionally be doing it in the resids
+    # for this exposure.  i.e., if this exposure is bad,
+    # we want to and should see it.
+    badfrac = 1 - np.sum(keep) / (l-f)
+    if np.all(keep == 0):
+        allbad = True
+    out[index] = det[index][ind[0]]
+
+    resid = det['cal'][ind] - det['avg'][ind]
+    if np.sum(keep) != 0:
+        out['median'] = np.median(resid[keep])
+        out['sd'] = stats.mad_std(resid[keep])
+        out['n'] = np.sum(keep)
+    else:
+        out['median'] = -999
+        out['sd'] = -999
+        out['n'] = 0
+    out['badfrac'] = badfrac
+
+    ss = util_efs.subslices(det['ccdnum'][ind])
+    for f, l in ss:
+        m = slice(f, l)
+        i = det['ccdnum'][ind[f]]
+        keep = det['neff'][ind[m]] > 0
+        nn = np.sum(keep)
+        out['n_chip'][0, i] = nn
+        if nn > 0:
+            out['median_chip'][0, i] = np.median(
+                resid[m][keep] - out['median'])  # offset relative to chip
+            out['sd_chip'][0, i] = stats.mad_std(resid[m][keep])
+        else:
+            out['median_chip'][0, i] = -999
+            out['sd_chip'][0, i] = -999
+
+    if ~np.isfinite(out['median']):
+        print('Bad median!')
+    return out
+
+
+def image_stats(obj, param, kwargs, index='expnum', nproc=1):
     print('add something for rejected nights to give them '
           'a default aterm?')
-    magds = list()
-    for i in obj:
-        magd = get_mags(obj[i], param, kwargs[i])
-        magds.append(magd)
-    calmags = np.concatenate([magd['cal'] for magd in magds])
-    avgmags = np.concatenate([magd['avg'] for magd in magds])
-    neffs = np.concatenate([magd['neff'] for magd in magds])
-    resid = calmags - avgmags
-    dmags = np.concatenate([obj[i]['dmag'] for i in obj])
-    idx = np.concatenate([obj[i][index] for i in obj])
-    bmasks = np.concatenate([obj[i]['bmask'] for i in obj])
-    s = np.argsort(idx)
-    ss = util_efs.subslices(idx[s])
+    # start by making a giant flat thing in memory; ugh.
+    ndet = np.sum([len(obj[i]['dmag']) for i in obj])
+    dtype = [('cal', 'f4'), ('avg', 'f4'), ('neff', 'i4'),
+             ('dmag', 'f4'), (index ,'i4'), ('bmask', 'i4'),
+             ('ccdnum', 'i4'), ('s', 'i4')]
+    size = ndet * np.dtype(dtype).itemsize
+    shm = multiprocessing.shared_memory.SharedMemory(
+        create=True, size=size)
+    det = np.ndarray(ndet, dtype=dtype, buffer=shm.buf)
+    # det = np.ndarray(ndet, dtype=dtype)
+    starts = np.cumsum([len(obj[i]['dmag']) for i in obj])
+    starts = np.concatenate([[0], starts[:-1]])
+
+    global_saved_data['obj'] = obj
+    global_saved_data['kwargs'] = kwargs
+
+    if nproc == 1:
+        pool = None
+    else:
+        pool = multiprocessing.Pool(nproc)
+
+    if pool is None:
+        for i, start in zip(obj, starts):
+            det[start:start+len(obj[i])] = fill_det(
+                i, param, det.dtype)
+    else:
+        args = [(i, param, det.dtype)
+                for i in obj]
+        for start, det0 in zip(starts, pool.starmap(fill_det, args)):
+            det[start:start+len(det0)] = det0
+
+    s = np.lexsort([det['ccdnum'], det[index]])
+    det['s'] = s
+    ss = util_efs.subslices(det[index][s])
     out = np.zeros(len(ss), dtype=[
         (index, 'i4'), ('mjd_obs', 'f8'), ('median', 'f4'),
         ('sd', 'f4'), ('bmask', 'i4'),
-        ('n', 'i4'), ('badfrac', 'f4')])
-    for i, (f, l) in enumerate(ss):
-        m0 = s[f:l]
-        magok = neffs[m0] > 0
-        keep = (bmasks[m0] & ~image_masks) == 0
-        allbad = False
-        if np.all(keep == 0):
-            keep[...] = True
-            allbad = True
-            # if everything on this image is clipped, keep anyway for
-            # statistics computations.
-        keep = keep & magok
-        out[index][i] = idx[m0[0]]
-        if np.sum(keep) != 0:
-            out['median'][i] = np.median((calmags[m0] - avgmags[m0])[keep])
-            out['sd'][i] = stats.mad_std((calmags[m0] - avgmags[m0])[keep])
-            out['n'][i] = np.sum(keep)
-        else:
-            out['median'][i] = -999
-            out['sd'][i] = -999
-            out['n'][i] = 0
-        if not allbad:
-            out['badfrac'][i] = 1 - np.sum(keep)/(l - f)
-        else:
-            out['badfrac'][i] = 1
-        if ~np.isfinite(out['median'][i]):
-            import pdb
-            pdb.set_trace()
+        ('n', 'i4'), ('badfrac', 'f4'),
+        ('median_chip', '64f4'), ('sd_chip', '64f4'),
+        ('n_chip', '64f4'), ('bmask_chip', '64i4')])
+    if pool is None:
+        for i, (f, l) in enumerate(ss):
+            out[i:i+1] = exp_image_stats(shm.name, ndet, f, l, out.dtype, det.dtype)
+    else:
+        starts = np.concatenate([[0], ss.uind[:-1] + 1])
+        starts = starts[::1000]
+        lasts = np.concatenate([starts[1:], [len(det)]])
+        args = [(shm.name, ndet, f, l, out.dtype, det.dtype) for f, l in zip(starts, lasts)]
+        out = np.concatenate(pool.starmap(exp_image_stats, args))
+
     for i in obj:
         ind = np.searchsorted(out['expnum'], obj[i]['expnum'])
         uind, loc = np.unique(ind, return_index=True)
         out['mjd_obs'][ind[loc]] = obj[i]['mjd_obs'][loc]
+
+    if pool is not None:
+        pool.terminate()
+
+    shm.close()
+    shm.unlink()
 
     return out
 
@@ -949,8 +1053,13 @@ def clip_stars(obj, param, kwargs, imstats, index='expnum', badfun=None):
     imstats['bmask'] |= badmask['image_median'] * (
         imstats['median'] - medmed) < -100 * sdmed
     imstats['bmask'] |= badmask['image_scatter'] * (
-        np.abs(imstats['sd'] - medsd) > 30 * sdsd)
+        np.abs(imstats['sd'] - medsd) > 20 * sdsd)
     imstats['bmask'] |= badmask['image_noobs'] * (imstats['n'] == 0)
+    imstats['bmask'] |= badmask['image_manybad'] * (imstats['badfrac'] > 0.5)
+    # imstats['bmask_chip'] |= badmask['image_chip'] * (
+    #     (imstats['n_chip'] > 0) &
+    #     (imstats['median_chip'] > imstats['image_scatter'] * 5))
+    #     # one sided; only chips where the stars all look too faint.
     imclipfrac = np.sum(imstats['bmask'] != 0) / len(imstats)
     print(f'Typical image medians: mu={medmed:.4f}, sd={sdmed:.4f}')
     print(f'Typical image sds: mu={medsd:.4f}, sd={sdsd:.4f}')
@@ -979,33 +1088,39 @@ def clip_stars(obj, param, kwargs, imstats, index='expnum', badfun=None):
     # It would be better to loop over the exposures,
     # and then iterate over the number of observations each star
     # got on that exposure, but that's not what we do here.
-    nobs = 0
-    nclipobs = 0
-    for i in obj:
-        magd = get_mags(obj[i], param, kwargs[i])
-        s = np.argsort(magd['neff'])
-        for f, l in util_efs.subslices(magd['neff'][s]):
-            ind = s[f:l]
-            obj[i]['bmask'][ind] &= image_masks  # clear per-star mask
-            if magd['neff'][ind[0]] <= 1:
-                # this star has <=1 good observation remaining.
-                # we can't use it.
-                obj[i]['bmask'][ind] |= badmask['star_noobs']
-            else:
-                eind = np.searchsorted(imstats['expnum'], obj[i]['expnum'][ind])
-                zpoff = imstats['median'][eind]
-                imsd = imstats['sd'][eind]
-                mbadoff = imsd < 0
-                imsd = np.clip(imsd, 0, np.inf)
-                zpoff[mbadoff] = 0
-                resid = magd['cal'][ind] - magd['avg'][ind] - zpoff
-                med = np.median(resid)
-                sd = stats.mad_std(resid)
-                obj[i]['bmask'][ind] |= badmask['star_resid'] * (
-                    np.abs(resid - med) > 5 * np.hypot(sd, imsd))
-        nobs += len(obj[i])
-        nclipobs += np.sum(obj[i]['bmask'] != 0)
-    print(f'Clipped {nclipobs*100/nobs:.1f}% of observations.')
+    # nobs = 0
+    # nclipobs = 0
+    # for i in obj:
+    #     magd = get_mags(obj[i], param, kwargs[i])
+    #     s = np.argsort(magd['neff'])
+    #     for f, l in util_efs.subslices(magd['neff'][s]):
+    #         ind = s[f:l]
+    #         obj[i]['bmask'][ind] &= ~star_masks  # clear per-star mask
+    #         if magd['neff'][ind[0]] <= 1:
+    #             # this star has <=1 good observation remaining.
+    #             # we can't use it.
+    #             obj[i]['bmask'][ind] |= badmask['star_noobs']
+    #         else:
+    #             eind = np.searchsorted(imstats['expnum'], obj[i]['expnum'][ind])
+    #             zpoff = imstats['median'][eind]
+    #             imsd = imstats['sd'][eind]
+    #             mbadoff = imsd < 0
+    #             imsd = np.clip(imsd, 0, np.inf)
+    #             zpoff[mbadoff] = 0
+    #             resid = magd['cal'][ind] - magd['avg'][ind] - zpoff
+    #             med = np.median(resid)
+    #             sd = stats.mad_std(resid)
+    #             obj[i]['bmask'][ind] |= badmask['star_resid'] * (
+    #                 np.abs(resid - med) > 5 * np.hypot(sd, imsd))
+    #     nobs += len(obj[i])
+    #     nclipobs += np.sum(obj[i]['bmask'] != 0)
+    # RELY ON ROBUST CHI2 MINIMIZATION INSTEAD?!
+    # the issue here is that one chip can be bad by ~6 mag.
+    # we want to detect that case.
+    # here all the stars on that chip get removed from all exposures
+    # and then that chip ends up looking "okay" but with a weird
+    # number of stars.  That's a problem.
+    # print(f'Clipped {nclipobs*100/nobs:.1f}% of observations.')
 
     # # additional observation-by-observation masking
     # s = np.argsort(imstats[index])
@@ -1151,7 +1266,7 @@ def fpim(fpvec, ccdfac=16*8, nx=256, ny=256, nxv=8, nyv=16):
     row0 = 0
     col0 = 0
     count = 0
-    fpvec = fpvec[ccdfac:]
+    fpvec = fpvec[ccdfac:]  # no CCD 0; first ccdfac are alway all 0.
     if (len(fpvec) % (ccdfac)) != 0:
         newsize = int(np.ceil(len(fpvec)/1./ccdfac)*ccdfac)
         fpvec2 = np.zeros(newsize, dtype=fpvec.dtype)
