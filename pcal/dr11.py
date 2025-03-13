@@ -250,7 +250,12 @@ def flat_output(basename, ccds, plotfn=None):
     keepccd[:] = False
     ccd_offsets = dict()
     ccdfilt = ccds['filter'].astype('U1')
-    flatvec = dict()
+    flatvecs = dict()
+    ccdalt, ccdaz = util_efs.rdllmjd2altaz(
+        ccds['ra'], ccds['dec'], -30.16966100, -70.80652500, ccds['mjd_obs'],
+        precess=False)
+    ccds['airmass'] = util_efs.alt2airmass(ccdalt)
+
     for f in 'griz':
         res, stats0, paramdat, _ = pickle.load(open(basename.format(f), 'rb'))
         statsa.append(stats0)
@@ -258,21 +263,33 @@ def flat_output(basename, ccds, plotfn=None):
         mjdnum = pcal.mjdnum(ccds['mjd_obs'][m])
         mn = np.flatnonzero(paramdat['descr'] == 'nightly a-term')
         mp, mm = util_efs.match(paramdat['idx'][mn], mjdnum)
-        zp0 = res.x[mn[mp]] - (ccds['airmass'][m[mm]] - 1.1) * res.x[0]
+        aterm = res.x[mn[mp]]
+        kterm = res.x[paramdat['descr'] == 'k-term']
+        if np.any(paramdat['descr'] == 'nightly k-term'):
+            mkn = np.flatnonzero(paramdat['descr'] == 'nightly k-term')
+            mpk, mmk = util_efs.match(paramdat['idx'][mkn], mjdnum)
+            kterm = kterm + res.x[mkn[mpk]]
+        zp0 = aterm - (ccds['airmass'][m[mm]] - 1.1) * kterm
         zpc[m[mm]] = zp0
         npccd = 16*8
-        fpvec = res.x[-npccd*63:]
-        ccd_offsets0 = list([np.nan])
-        for i in range(1, 63):
-            tccd = fpvec[npccd*i:npccd*(i+1)]
-            m = tccd != 0
-            if np.sum(m) == 0:
-                med = 0
-            else:
-                med = np.median(tccd[m])
-            ccd_offsets0.append(med)
-        ccd_offsets[f] = np.array(ccd_offsets0)
-        flatvec[f] = fpvec
+        for flattype in ['f-term', 'color-flat']:
+            mf = paramdat['descr'] == flattype
+            if not np.any(mf):
+                continue
+            if flattype not in flatvecs:
+                flatvecs[flattype] = dict()
+            fpvec = res.x[mf]
+            ccd_offsets0 = list([np.nan])
+            for i in range(1, 63):
+                tccd = fpvec[npccd*i:npccd*(i+1)]
+                m = tccd != 0
+                if np.sum(m) == 0:
+                    med = 0
+                else:
+                    med = np.median(tccd[m])
+                ccd_offsets0.append(med)
+            ccd_offsets[f] = np.array(ccd_offsets0)
+            flatvecs[flattype][f] = fpvec
 
     stats = np.concatenate(statsa)
     ms, mc = util_efs.match(stats['expnum'], ccds['expnum'])
@@ -317,31 +334,33 @@ def flat_output(basename, ccds, plotfn=None):
     keepccd[mc] = keep[ms] & ~badchip[ms, ccdnum[mc]]
     ccds = rec_append_fields(ccds, ['pcalzpt', 'pcalkeep'], [zpc, keepccd])
     if plotfn is not None:
-        make_plots(ccds, stats, flatvec, plotfn)
-    return ccds, stats, flatvec
+        make_plots(ccds, stats, flatvecs, plotfn)
+    return ccds, stats, flatvecs
 
 
-def make_plots(ccds, stats, flatvec, plotfn=None, filters='griz'):
+def make_plots(ccds, stats, flatvecs, plotfn=None, filters='griz'):
     from matplotlib.backends.backend_pdf import PdfPages
     from matplotlib import pyplot as p
     import pcal
     if plotfn is not None:
         pdf = PdfPages(plotfn)
     from astropy.stats import mad_std
-    for f in 'griz':
-        if plotfn is None:
-            p.figure()
-        fpim = pcal.fpim(flatvec[f])
-        p.clf()
-        p.imshow(fpim, vmin=-0.02, vmax=0.02, origin='lower', cmap='binary')
-        p.title(f)
-        mu = np.median(fpim[fpim != 0])
-        sigma = mad_std(fpim[fpim != 0])
-        p.text(5, 8, rf'$\mu={mu:6.3f}$')
-        p.text(5, 4, rf'$\sigma={sigma:6.3f}$')
-        p.colorbar()
-        if plotfn is not None:
-            pdf.savefig()
+    for flattype in flatvecs:
+        flatvec = flatvecs[flattype]
+        for f in 'griz':
+            if plotfn is None:
+                p.figure()
+            fpim = pcal.fpim(flatvec[f])
+            p.clf()
+            p.imshow(fpim, vmin=-0.02, vmax=0.02, origin='lower', cmap='binary')
+            p.title(f)
+            mu = np.median(fpim[fpim != 0])
+            sigma = mad_std(fpim[fpim != 0])
+            p.text(5, 8, rf'$\mu={mu:6.3f}$')
+            p.text(5, 4, rf'$\sigma={sigma:6.3f}$')
+            p.colorbar()
+            if plotfn is not None:
+                pdf.savefig()
     filt = ccds['filter'].astype('U1')
     ccdname = ccds['ccdname'].astype('U3')
     for f in filters:

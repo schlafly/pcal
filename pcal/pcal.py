@@ -607,7 +607,7 @@ def solve_generic(obj):
 
 def solve_dr11(obj, nproc=1, method='L-BFGS-B',
                options=None, clear_bmask=True,
-               guess=None, optiter=30, clipiter=5, badfun=None):
+               guess=None, optiter=30, clipiter=6, badfun=None):
     kwargs = dict()
 
     kwargs['hplist'] = list(obj.keys())
@@ -638,31 +638,49 @@ def solve_dr11(obj, nproc=1, method='L-BFGS-B',
     maxpidx = 0
     for hp in obj.keys():
         tobj = obj[hp]
-        # kwargs[hp]['idxlist'] = (
-        #     0, 1, 2, 3, 4 + tobj['idx'],
-        #     5 + maxnidx + tobj['fidx'],
-        #     6 + maxnidx + maxfidx + tobj['fidx'])
-        # # k term, fwhm, fwhm**2, color-airmass, nightly, flat field,
-        # # color-flat
-        dairmass = tobj['airmass'] - 1.1
-        # dcolor = np.clip(tobj['bp_rp'] - 0.5, -2, 2)
-        # dfwhm = np.clip(tobj['fwhm'] - 1.1, -1, 3)
-        # kwargs[hp]['coefflist'] = (dairmass,
-        #                            dfwhm, dfwhm**2,
-        #                            dcolor * dairmass,
-        #                            1, 1, dcolor)
         kwargs[hp]['idxlist'] = (
-            0, 1 + tobj['idx'], 2 + maxnidx + tobj['fidx'])
-        kwargs[hp]['coefflist'] = (-dairmass, 1, 1)
+            0, 1, 2, 3,
+            4 + tobj['idx'],
+            5 + maxnidx + tobj['idx'],
+            6 + 2*maxnidx + tobj['fidx'],
+            7 + 2*maxnidx + maxfidx + tobj['fidx'])
+        # k term, fwhm, fwhm**2, color-airmass, nightly, flat field,
+        # color-flat
+        dairmass = tobj['airmass'] - 1.1
+        dcolor = np.clip(tobj['bp_rp'] - 0.5, -2, 2)
+        dfwhm = np.clip(tobj['fwhm'] - 1.1, -1, 3)
+        kwargs[hp]['coefflist'] = (-dairmass,
+                                   dfwhm,
+                                   dfwhm**2,
+                                   dcolor * dairmass,
+                                   1,
+                                   -dairmass,
+                                   1,
+                                   dcolor)
+        # kwargs[hp]['idxlist'] = (
+        #     0, 1 + tobj['idx'], 2 + maxnidx + tobj['fidx'])
+        # kwargs[hp]['coefflist'] = (-dairmass, 1, 1)
         maxpidx = max(maxpidx, np.max([
             np.max(x, initial=0) for x in kwargs[hp]['idxlist']]))
 
     paramdat = np.zeros(maxpidx + 1, dtype=[('descr', 'U80'), ('idx', 'i4')])
-    paramdat[0] = ('k-term', 0)
-    paramdat['descr'][1:maxnidx + 2] = 'nightly a-term'
-    paramdat['idx'][1:maxnidx + 2] = unight
-    paramdat['descr'][2+maxnidx:] = 'f-term'
-    paramdat['idx'][2+maxnidx:] = np.arange(maxfidx + 1)
+    # paramdat[0] = ('k-term', 0)
+    # paramdat['descr'][1:maxnidx + 2] = 'nightly a-term'
+    # paramdat['idx'][1:maxnidx + 2] = unight
+    # paramdat['descr'][2+maxnidx:] = 'f-term'
+    # paramdat['idx'][2+maxnidx:] = np.arange(maxfidx + 1)
+    paramdat[0] = ('k-term', 0)  # 1
+    paramdat[1] = ('fwhm-term-1', 1)  # 2
+    paramdat[2] = ('fwhm-term-2', 2)  # 3
+    paramdat[3] = ('color-airmass', 3)  # 4
+    paramdat['descr'][4:maxnidx + 5] = 'nightly a-term'  # 5
+    paramdat['idx'][4:maxnidx + 5] = unight
+    paramdat['descr'][5+maxnidx:2*maxnidx + 6] = 'nightly k-term'  # 6
+    paramdat['idx'][5+maxnidx:2*maxnidx + 6] = unight
+    paramdat['descr'][6+2*maxnidx:7+2*maxnidx+maxfidx] = 'f-term'  # 7
+    paramdat['idx'][6+2*maxnidx:7+2*maxnidx+maxfidx] = np.arange(maxfidx + 1)
+    paramdat['descr'][7+2*maxnidx+maxfidx:8+2*maxnidx+2*maxfidx] = 'color-flat'  # 8
+    paramdat['idx'][7+2*maxnidx+maxfidx:8+2*maxnidx+2*maxfidx] = np.arange(maxfidx + 1)
 
     print('negated the dairmass term')
     nstar = np.sum([len(kwargs[hp]['uobjid'])
@@ -684,12 +702,7 @@ def solve_dr11(obj, nproc=1, method='L-BFGS-B',
     if options is None:
         options = dict(iprint=1)
 
-    print('a next step here is to walk in the clipping from large to small '
-          'to try to clip bad exposures before the good exposures they '
-          'overlap.  I think a good approach there is to give clip_stars '
-          'a scale argument that drops by a factor of two each iteration.')
     for i in range(clipiter):
-
         if nproc > 1:
             # from concurrent.futures import ProcessPoolExecutor
             # executor = ProcessPoolExecutor(max_workers=nproc)
@@ -705,7 +718,8 @@ def solve_dr11(obj, nproc=1, method='L-BFGS-B',
                        options=options)
         guess = res.x
         imstats = image_stats(obj, res.x, kwargs, nproc=nproc)
-        clip_stars(obj, res.x, kwargs, imstats, badfun=badfun)
+        clip_stars(obj, res.x, kwargs, imstats, badfun=badfun,
+                   clipscale=2**(clipiter-i-1))
         # need to reach into kwargs again
         compute_weights_and_averages(obj)  # recompute weights
         for hp in kwargs['hplist']:
@@ -921,9 +935,6 @@ def exp_image_stats(shm, ndet, f, l, outdtype, detdtype):
     # but we may intentionally be doing it in the resids
     # for this exposure.  i.e., if this exposure is bad,
     # we want to and should see it.
-    badfrac = 1 - np.sum(keep) / (l-f)
-    if np.all(keep == 0):
-        allbad = True
     out[index] = det[index][ind[0]]
 
     resid = det['cal'][ind] - det['avg'][ind]
@@ -931,11 +942,14 @@ def exp_image_stats(shm, ndet, f, l, outdtype, detdtype):
         out['median'] = np.median(resid[keep])
         out['sd'] = stats.mad_std(resid[keep])
         out['n'] = np.sum(keep)
+        out['badfrac'] = (
+            np.sum(np.abs(resid[keep]) > 3 * out['sd']) /
+            len(keep))
     else:
         out['median'] = -999
         out['sd'] = -999
         out['n'] = 0
-    out['badfrac'] = badfrac
+        out['badfrac'] = 1.
 
     ss = util_efs.subslices(det['ccdnum'][ind])
     for f, l in ss:
@@ -1027,6 +1041,8 @@ def image_stats(obj, param, kwargs, index='expnum', nproc=1):
     # or on an image are clipped?
     # -> we still want to get a calibration for the exposure
     # -> any nights with no weight get default parameters??
+    # I think these just get zero for all parameters, which is
+    # actually a sensible default in all cases right now?
 
 
 def get_mags(obj, param, kwargs):
@@ -1040,7 +1056,8 @@ def get_mags(obj, param, kwargs):
     return dict(cal=cal, avg=avg, neff=neff, ntot=ntot)
 
 
-def clip_stars(obj, param, kwargs, imstats, index='expnum', badfun=None):
+def clip_stars(obj, param, kwargs, imstats, index='expnum', badfun=None,
+               clipscale=1):
     # image masking
     okstats = imstats['n'] > 0
     medmed = np.median(imstats['median'][okstats])
@@ -1049,17 +1066,14 @@ def clip_stars(obj, param, kwargs, imstats, index='expnum', badfun=None):
     sdsd = stats.mad_std(imstats['sd'][okstats])
     imstats['bmask'] = 0
     imstats['bmask'] |= badmask['image_median'] * (
-        imstats['median'] - medmed) > 10 * sdmed
-    imstats['bmask'] |= badmask['image_median'] * (
-        imstats['median'] - medmed) < -100 * sdmed
+        np.abs(imstats['median'] - medmed) > 5 * sdmed * clipscale)
     imstats['bmask'] |= badmask['image_scatter'] * (
-        np.abs(imstats['sd'] - medsd) > 20 * sdsd)
+        np.abs(imstats['sd'] - medsd) > 5 * sdsd * clipscale)
     imstats['bmask'] |= badmask['image_noobs'] * (imstats['n'] == 0)
     imstats['bmask'] |= badmask['image_manybad'] * (imstats['badfrac'] > 0.5)
-    # imstats['bmask_chip'] |= badmask['image_chip'] * (
-    #     (imstats['n_chip'] > 0) &
-    #     (imstats['median_chip'] > imstats['image_scatter'] * 5))
-    #     # one sided; only chips where the stars all look too faint.
+    imstats['bmask_chip'] |= badmask['image_chip'] * (
+        (imstats['n_chip'] > 0) &
+        (np.abs(imstats['median_chip']) > imstats['sd'][:, None] * 5 * clipscale))
     imclipfrac = np.sum(imstats['bmask'] != 0) / len(imstats)
     print(f'Typical image medians: mu={medmed:.4f}, sd={sdmed:.4f}')
     print(f'Typical image sds: mu={medsd:.4f}, sd={sdsd:.4f}')
