@@ -647,7 +647,7 @@ def solve_dr11(obj, nproc=1, method='L-BFGS-B',
         # k term, fwhm, fwhm**2, color-airmass, nightly, flat field,
         # color-flat
         dairmass = tobj['airmass'] - 1.1
-        dcolor = np.clip(tobj['bp_rp'] - 0.5, -2, 2)
+        dcolor = np.clip(tobj['bp_rp'] - 1, -1, 2)
         dfwhm = np.clip(tobj['fwhm'] - 1.1, -1, 3)
         kwargs[hp]['coefflist'] = (-dairmass,
                                    dfwhm,
@@ -927,7 +927,6 @@ def exp_image_stats(shm, ndet, f, l, outdtype, detdtype):
                             detdtype)
             for (f2, l2) in ss])
     out = np.zeros(1, dtype=outdtype)
-    keep = det['neff'][ind] > 0
     # intentionally do not use the bmasks here
     # trust instead median & mad_std to be robust.
     # note that the mean magnitudes _do_ use the bmasks
@@ -938,13 +937,14 @@ def exp_image_stats(shm, ndet, f, l, outdtype, detdtype):
     out[index] = det[index][ind[0]]
 
     resid = det['cal'][ind] - det['avg'][ind]
+    keep = (det['neff'][ind] > 0) & (resid != 0)
     if np.sum(keep) != 0:
         out['median'] = np.median(resid[keep])
         out['sd'] = stats.mad_std(resid[keep])
         out['n'] = np.sum(keep)
+        dresid = resid[keep] - out['median']
         out['badfrac'] = (
-            np.sum(np.abs(resid[keep]) > 3 * out['sd']) /
-            len(keep))
+            np.sum(np.abs(dresid) > 3 * out['sd']) / len(keep))
     else:
         out['median'] = -999
         out['sd'] = -999
@@ -955,7 +955,7 @@ def exp_image_stats(shm, ndet, f, l, outdtype, detdtype):
     for f, l in ss:
         m = slice(f, l)
         i = det['ccdnum'][ind[f]]
-        keep = det['neff'][ind[m]] > 0
+        keep = (det['neff'][ind[m]] > 0) & (resid[m] != 0)
         nn = np.sum(keep)
         out['n_chip'][0, i] = nn
         if nn > 0:
@@ -1070,7 +1070,7 @@ def clip_stars(obj, param, kwargs, imstats, index='expnum', badfun=None,
     imstats['bmask'] |= badmask['image_scatter'] * (
         np.abs(imstats['sd'] - medsd) > 5 * sdsd * clipscale)
     imstats['bmask'] |= badmask['image_noobs'] * (imstats['n'] == 0)
-    imstats['bmask'] |= badmask['image_manybad'] * (imstats['badfrac'] > 0.5)
+    imstats['bmask'] |= badmask['image_manybad'] * (imstats['badfrac'] > 0.2)
     imstats['bmask_chip'] |= badmask['image_chip'] * (
         (imstats['n_chip'] > 0) &
         (np.abs(imstats['median_chip']) > imstats['sd'][:, None] * 5 * clipscale))

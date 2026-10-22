@@ -206,9 +206,11 @@ class BadNightPlot:
         self.ax.figure.canvas.draw()
 
 
-def gather_photomfn():
+def gather_photomfn(ccdfni=None):
+    if ccdfni is None:
+        ccdfni = ccdfn
     imfn = []
-    for ccdfn0 in ccdfn:
+    for ccdfn0 in ccdfni:
         ccds = fits.getdata(ccdfn0)
         imfn0 = np.unique(ccds['image_filename'])
         imfn.append(imfn0)
@@ -235,7 +237,7 @@ def gather_photomfn():
     return photomfn, missing, matches
 
 
-def flat_output(basename, ccds, plotfn=None):
+def flat_output(basename, ccds, plotfn=None, gaiazp=None):
     # we need to:
     # gather the zero points
     # gather the flat field offsets
@@ -246,14 +248,17 @@ def flat_output(basename, ccds, plotfn=None):
     statsa = []
     zpc = np.zeros(len(ccds), dtype='f4')
     zpc[:] = np.nan
-    keepccd = np.zeros(len(ccds), dtype=bool)
-    keepccd[:] = False
+    zpccdoff = np.zeros(len(ccds), dtype='f4')
+    keepccd = np.zeros(len(ccds), dtype='i4')
+    keepexp = np.zeros(len(ccds), dtype=bool)
+    keepccd[:] = 0
+    keepexp[:] = False
     ccd_offsets = dict()
     ccdfilt = ccds['filter'].astype('U1')
     flatvecs = dict()
     ccdalt, ccdaz = util_efs.rdllmjd2altaz(
-        ccds['ra'], ccds['dec'], -30.16966100, -70.80652500, ccds['mjd_obs'],
-        precess=False)
+        ccds['ra'], ccds['dec'], -30.16966100, -70.80652500,
+        ccds['mjd_obs'], precess=True)
     ccds['airmass'] = util_efs.alt2airmass(ccdalt)
 
     for f in 'griz':
@@ -271,6 +276,15 @@ def flat_output(basename, ccds, plotfn=None):
             kterm = kterm + res.x[mkn[mpk]]
         zp0 = aterm - (ccds['airmass'][m[mm]] - 1.1) * kterm
         zpc[m[mm]] = zp0
+        if np.any(paramdat['descr'] == 'fwhm-term-1'):
+            mf1 = np.flatnonzero(paramdat['descr'] == 'fwhm-term-1')
+            mf2 = np.flatnonzero(paramdat['descr'] == 'fwhm-term-2')
+            assert len(mf1) == 1
+            assert len(mf2) == 1
+            term1 = res.x[paramdat['idx'][mf1[0]]]
+            term2 = res.x[paramdat['idx'][mf2[0]]]
+            dfwhm = np.clip(ccds['fwhm'] - 1.1, -1, 3)
+            zpc[m] += dfwhm[m] * term1 + dfwhm[m] ** 2 * term2
         npccd = 16*8
         for flattype in ['f-term', 'color-flat']:
             mf = paramdat['descr'] == flattype
@@ -300,6 +314,7 @@ def flat_output(basename, ccds, plotfn=None):
     for f in 'griz':
         m = ccdfilt == f
         zpc[m] += ccd_offsets[f][ccdnum[m]]
+        zpccdoff[m] = ccd_offsets[f][ccdnum[m]]
         mdec = ccds['dec'] > -28
         absoff = np.nanmedian(zpc[m & mdec] - ccds['ccdzpt'][m & mdec])
         zpc[m] -= absoff
@@ -309,7 +324,7 @@ def flat_output(basename, ccds, plotfn=None):
          (stats['sd_chip'][ms, ccdnum[mc]] > 0) &
          (stats['n_chip'][ms, ccdnum[mc]] > 5) &
          (ccdnum[mc] == 31))  # apply per-chip zero-point only to S7
-    zpc[mc[m]] -= stats['median_chip'][ms[m], ccdnum[mc[m]]]
+    # zpc[mc[m]] -= stats['median_chip'][ms[m], ccdnum[mc[m]]]
     print('not applying median chip offsets')
     badchip = (stats['n_chip'] >= 1) & (
         (stats['sd_chip'] > 0.04) | (np.abs(stats['median_chip']) > 0.2))
@@ -323,7 +338,7 @@ def flat_output(basename, ccds, plotfn=None):
 
     from numpy.lib.recfunctions import rec_append_fields
     keep = ((stats['sd'] < 0.04) & (stats['sd'] > 0) &
-            np.abs(stats['median'] < 0.2) & (stats['n'] > 700) &
+            (np.abs(stats['median']) < 0.2) & (stats['n'] > 700) &
             (betweenchipscatter < 0.04) & (stats['badfrac'] < 0.15))
     stats = rec_append_fields(
         stats, ['zpt', 'keep'],
@@ -331,7 +346,31 @@ def flat_output(basename, ccds, plotfn=None):
     stats['zpt'][ms] = zpc[mc]
     stats['keep'][ms] = keep[ms]
 
-    keepccd[mc] = keep[ms] & ~badchip[ms, ccdnum[mc]]
+    keepccd[mc] = 1 * (keep[ms] & ~badchip[ms, ccdnum[mc]])
+    keepexp[mc] = keep[ms]
+
+    if gaiazp is not None:
+        mg2, mc2 = util_efs.match(gaiazp['expnum'], ccds['expnum'])
+        keepexpgaia = np.zeros(len(keepexp), dtype='bool')
+        keepexpgaia[mc2] = gaiazp['good'][mg2]
+        zpgaia = zpc * 0
+        zpgaia[mc2] = gaiazp['median'][mg2]
+        zpgaia += zpccdoff
+        print('gaia absolute zp adjustments')
+        for f in 'griz':
+            # match absolute zero points
+            m = ((ccdfilt == f) & (keepccd != 0) &
+                 keepexpgaia)
+            off = np.nanmedian(zpgaia[m] - zpc[m])
+            zpgaia[ccdfilt == f] -= off
+            print(f, off)
+            if ~np.isfinite(off):
+                import pdb
+                pdb.set_trace()
+        mreplace = keepexpgaia & (ccdnum != 31) & ~keepexp
+        zpc[mreplace] = zpgaia[mreplace]
+        keepccd[mreplace] = 2
+
     ccds = rec_append_fields(ccds, ['pcalzpt', 'pcalkeep'], [zpc, keepccd])
     if plotfn is not None:
         make_plots(ccds, stats, flatvecs, plotfn)
@@ -373,7 +412,7 @@ def make_plots(ccds, stats, flatvecs, plotfn=None, filters='griz'):
         sig1 = mad_std(ccds['pcalzpt'][m1] - ccds['zpt'][m1])
         m2 = m & (ccds['dec'] > -28)
         med2 = np.median(ccds['pcalzpt'][m2] - ccds['ccdzpt'][m2])
-        m3 = (m  # & (np.random.uniform(size=len(filt)) > 0.99)
+        m3 = (m  & (np.random.uniform(size=len(filt)) > 0.99)
              & (ccdname == 'N4'))
         p.scatter(ccds['ra'][m3], ccds['dec'][m3],
                   c=(ccds['pcalzpt'][m3] - ccds['ccdzpt'][m3]),
